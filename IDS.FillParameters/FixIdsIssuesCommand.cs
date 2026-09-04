@@ -55,6 +55,8 @@ namespace IDS
     {
         public string Tag { get; set; }
         public int ElementId { get; set; }
+        public string GlobalId { get; set; }       // Добавлено
+        public bool IsGuidSearch { get; set; }      // Добавлено
         public List<IdsIssue> Issues { get; set; } = new List<IdsIssue>();
     }
 
@@ -547,20 +549,55 @@ namespace IDS
                         return Result.Succeeded;
                     }
 
-                    var groupedIssues = new List<ElementIssues>();
-                    int parseErrors = 0;
-
-                    foreach (var group in issues.Where(i => !string.IsNullOrEmpty(i.Tag)).GroupBy(i => i.Tag))
+                    // Фильтруем проблемы: оставляем те, где есть валидный ID (Tag) ИЛИ валидный GlobalId
+                    var validIssues = issues.Where(i =>
                     {
-                        if (int.TryParse(group.Key, out int elementId))
+                        bool hasValidTag = !string.IsNullOrWhiteSpace(i.Tag) &&
+                                           i.Tag.Trim().ToLower() != "none" &&
+                                           int.TryParse(i.Tag, out _);
+                        bool hasValidGuid = !string.IsNullOrWhiteSpace(i.GlobalId);
+                        return hasValidTag || hasValidGuid;
+                    }).ToList();
+
+                    var groupedIssues = new List<ElementIssues>();
+
+                    // Группируем по уникальному ключу (ID или GUID)
+                    var groups = validIssues.GroupBy(i =>
+                    {
+                        bool hasValidTag = !string.IsNullOrWhiteSpace(i.Tag) &&
+                                           i.Tag.Trim().ToLower() != "none" &&
+                                           int.TryParse(i.Tag, out _);
+                        return hasValidTag ? $"ID_{i.Tag}" : $"GUID_{i.GlobalId}";
+                    });
+
+                    foreach (var group in groups)
+                    {
+                        var firstIssue = group.First();
+                        var elementIssue = new ElementIssues { Issues = group.ToList() };
+
+                        // ИСПРАВЛЕНИЕ ОШИБКИ CS0165:
+                        // Выносим парсинг ID в отдельный блок, чтобы гарантировать инициализацию переменной 'id'
+                        bool hasValidTag = false;
+                        int id = 0;
+
+                        if (!string.IsNullOrWhiteSpace(firstIssue.Tag) &&
+                            firstIssue.Tag.Trim().ToLower() != "none")
                         {
-                            groupedIssues.Add(new ElementIssues { Tag = group.Key, ElementId = elementId, Issues = group.ToList() });
+                            hasValidTag = int.TryParse(firstIssue.Tag, out id);
+                        }
+
+                        if (hasValidTag)
+                        {
+                            elementIssue.Tag = firstIssue.Tag;
+                            elementIssue.ElementId = id;
+                            elementIssue.IsGuidSearch = false;
                         }
                         else
                         {
-                            Logger.Warning($"[FixIdsIssuesCommand] Tag '{group.Key}' не является числовым ID, пропущено");
-                            parseErrors++;
+                            elementIssue.GlobalId = firstIssue.GlobalId;
+                            elementIssue.IsGuidSearch = true;
                         }
+                        groupedIssues.Add(elementIssue);
                     }
 
                     var generator = new ValueGenerator();
@@ -572,12 +609,27 @@ namespace IDS
 
                         foreach (var elementIssues in groupedIssues)
                         {
-                            var element = FindElementById(doc, elementIssues.ElementId);
-                            if (element == null)
+                            Element element = null;
+
+                            if (elementIssues.IsGuidSearch)
                             {
-                                Logger.Warning($"[FixIdsIssuesCommand] Элемент с ID={elementIssues.ElementId} не найден");
-                                totalNotFound++;
-                                continue;
+                                element = FindElementByIfcGuid(doc, elementIssues.GlobalId);
+                                if (element == null)
+                                {
+                                    Logger.Warning($"[FixIdsIssuesCommand] Элемент с IfcGUID={elementIssues.GlobalId} не найден");
+                                    totalNotFound++;
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                element = FindElementById(doc, elementIssues.ElementId);
+                                if (element == null)
+                                {
+                                    Logger.Warning($"[FixIdsIssuesCommand] Элемент с ID={elementIssues.ElementId} не найден");
+                                    totalNotFound++;
+                                    continue;
+                                }
                             }
 
                             foreach (var issue in elementIssues.Issues)
@@ -592,7 +644,7 @@ namespace IDS
                                 var param = EnsureParameterOnElement(doc, element, mappingEntry.RevitParameterName, mappingEntry.DataType);
                                 if (param == null)
                                 {
-                                    Logger.Warning($"[FixIdsIssuesCommand] Не удалось создать/найти параметр '{mappingEntry.RevitParameterName}' для элемента ID={elementIssues.ElementId}");
+                                    Logger.Warning($"[FixIdsIssuesCommand] Не удалось создать/найти параметр '{mappingEntry.RevitParameterName}' для элемента {element.Id}");
                                     totalSkipped++;
                                     continue;
                                 }
@@ -609,7 +661,7 @@ namespace IDS
                                 try
                                 {
                                     SetParameterValue(param, value, mappingEntry.DataType);
-                                    Logger.Debug($"[FixIdsIssuesCommand] Заполнен параметр {mappingEntry.RevitParameterName} = '{value}' для элемента ID={elementIssues.ElementId}");
+                                    Logger.Debug($"[FixIdsIssuesCommand] Заполнен параметр {mappingEntry.RevitParameterName} = '{value}' для элемента {element.Id}");
                                     totalFixed++;
                                 }
                                 catch (Exception ex)
@@ -685,6 +737,47 @@ namespace IDS
                         Logger.Warning($"[SetParameterValue] Неизвестный тип параметра: {param.StorageType}");
                         break;
                 }
+            }
+
+            private Element FindElementByIfcGuid(Document doc, string ifcGuid)
+            {
+                if (string.IsNullOrWhiteSpace(ifcGuid)) return null;
+
+                // 1. Приоритетный поиск в Помещениях и Зонах (OST_Rooms, OST_Areas)
+                var targetCategories = new[] { BuiltInCategory.OST_Rooms, BuiltInCategory.OST_Areas };
+
+                foreach (var bic in targetCategories)
+                {
+                    var collector = new FilteredElementCollector(doc)
+                        .OfCategory(bic)
+                        .WhereElementIsNotElementType();
+
+                    foreach (var elem in collector)
+                    {
+                        var param = elem.LookupParameter("IfcGUID");
+                        if (param != null && param.HasValue && param.AsString() == ifcGuid)
+                        {
+                            Logger.Debug($"[FindElementByIfcGuid] Найден элемент {elem.Id} в категории {bic} по IfcGUID");
+                            return elem;
+                        }
+                    }
+                }
+
+                // 2. Fallback: Поиск по всей модели, если элемент не в Rooms/Areas
+                Logger.Debug($"[FindElementByIfcGuid] Поиск в ROOMS/AREAS не дал результатов, запускаю полный поиск для {ifcGuid}");
+                var allElements = new FilteredElementCollector(doc).WhereElementIsNotElementType();
+
+                foreach (var elem in allElements)
+                {
+                    var param = elem.LookupParameter("IfcGUID");
+                    if (param != null && param.HasValue && param.AsString() == ifcGuid)
+                    {
+                        Logger.Debug($"[FindElementByIfcGuid] Найден элемент {elem.Id} в общем поиске по IfcGUID");
+                        return elem;
+                    }
+                }
+
+                return null;
             }
 
             private Element FindElementById(Document doc, int elementId)
