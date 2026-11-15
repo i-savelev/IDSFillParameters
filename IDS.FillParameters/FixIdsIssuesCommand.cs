@@ -57,6 +57,7 @@ namespace IDS
         public int ElementId { get; set; }
         public string GlobalId { get; set; }       // Добавлено
         public bool IsGuidSearch { get; set; }      // Добавлено
+        public bool IsProjectInfoCandidate { get; set; } // IfcSite/IfcBuilding: fallback to ProjectInformation
         public List<IdsIssue> Issues { get; set; } = new List<IdsIssue>();
     }
 
@@ -341,7 +342,7 @@ namespace IDS
             issue.RestrictionType = RestrictionType.None;
         }
 
-    #endregion
+        #endregion
 
         #region Value Generator
 
@@ -556,7 +557,9 @@ namespace IDS
                                            i.Tag.Trim().ToLower() != "none" &&
                                            int.TryParse(i.Tag, out _);
                         bool hasValidGuid = !string.IsNullOrWhiteSpace(i.GlobalId);
-                        return hasValidTag || hasValidGuid;
+                        // IfcSite/IfcBuilding без Tag обрабатываем как сведения о проекте,
+                        // даже если в отчёте отсутствует GlobalId.
+                        return hasValidTag || hasValidGuid || IsProjectInfoIfcClass(i.IfcClass);
                     }).ToList();
 
                     var groupedIssues = new List<ElementIssues>();
@@ -567,13 +570,23 @@ namespace IDS
                         bool hasValidTag = !string.IsNullOrWhiteSpace(i.Tag) &&
                                            i.Tag.Trim().ToLower() != "none" &&
                                            int.TryParse(i.Tag, out _);
+
+                        // IfcSite/IfcBuilding без Tag — это сведения о проекте.
+                        // Все такие проверки объединяем в одну группу ProjectInformation.
+                        if (!hasValidTag && IsProjectInfoIfcClass(i.IfcClass))
+                            return "PROJECT_INFO";
+
                         return hasValidTag ? $"ID_{i.Tag}" : $"GUID_{i.GlobalId}";
                     });
 
                     foreach (var group in groups)
                     {
                         var firstIssue = group.First();
-                        var elementIssue = new ElementIssues { Issues = group.ToList() };
+                        var elementIssue = new ElementIssues
+                        {
+                            Issues = group.ToList(),
+                            IsProjectInfoCandidate = group.Any(i => IsProjectInfoIfcClass(i.IfcClass))
+                        };
 
                         // ИСПРАВЛЕНИЕ ОШИБКИ CS0165:
                         // Выносим парсинг ID в отдельный блок, чтобы гарантировать инициализацию переменной 'id'
@@ -614,6 +627,12 @@ namespace IDS
                             if (elementIssues.IsGuidSearch)
                             {
                                 element = FindElementByIfcGuid(doc, elementIssues.GlobalId);
+                                if (element == null && elementIssues.IsProjectInfoCandidate)
+                                {
+                                    element = doc.ProjectInformation;
+                                    Logger.Info("[FixIdsIssuesCommand] IfcSite/IfcBuilding не найден по GlobalId; используется ProjectInformation");
+                                }
+
                                 if (element == null)
                                 {
                                     Logger.Warning($"[FixIdsIssuesCommand] Элемент с IfcGUID={elementIssues.GlobalId} не найден");
@@ -624,6 +643,12 @@ namespace IDS
                             else
                             {
                                 element = FindElementById(doc, elementIssues.ElementId);
+                                if (element == null && elementIssues.IsProjectInfoCandidate)
+                                {
+                                    element = doc.ProjectInformation;
+                                    Logger.Info($"[FixIdsIssuesCommand] IfcSite/IfcBuilding с Tag={elementIssues.Tag} не найден; используется ProjectInformation");
+                                }
+
                                 if (element == null)
                                 {
                                     Logger.Warning($"[FixIdsIssuesCommand] Элемент с ID={elementIssues.ElementId} не найден");
@@ -686,6 +711,12 @@ namespace IDS
                     message = ex.Message;
                     return Result.Failed;
                 }
+            }
+
+            private static bool IsProjectInfoIfcClass(string ifcClass)
+            {
+                return string.Equals(ifcClass?.Trim(), "IfcSite", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(ifcClass?.Trim(), "IfcBuilding", StringComparison.OrdinalIgnoreCase);
             }
 
             private void ConfigureLogging(ExternalCommandData commandData)
@@ -823,6 +854,14 @@ namespace IDS
                 if (param != null) return param;
 
                 var category = element.Category;
+
+                // ProjectInformation может не возвращать Category через Element.Category.
+                // Для привязки Shared Parameter используем категорию Project Information.
+                if (category == null && element is ProjectInfo)
+                {
+                    category = Category.GetCategory(doc, BuiltInCategory.OST_ProjectInformation);
+                }
+
                 if (category == null)
                 {
                     Logger.Warning($"[EnsureParameterOnElement] У элемента ID={element.Id} нет категории");
