@@ -701,8 +701,9 @@ namespace IDS
 
                     var unmappedProperties = issues.Select(i => i.PropertyName).Where(p => !string.IsNullOrEmpty(p) && !mapping.ContainsKey(p)).Distinct().ToList();
                     string unmappedReport = unmappedProperties.Count > 0 ? "\n\n❌ Незамапленные параметры:\n" + string.Join("\n", unmappedProperties.Take(10)) + (unmappedProperties.Count > 10 ? "\n..." : "") : "";
+                    DebugWindow.AddRow($"Заполнение завершено:\n✅ Заполнено: {totalFixed}\n⚠️ Пропущено: {totalSkipped}\n❌ Элементов не найдено: {totalNotFound}{unmappedReport}");
 
-                    TaskDialog.Show("IDS Fix", $"Заполнение завершено:\n✅ Заполнено: {totalFixed}\n⚠️ Пропущено: {totalSkipped}\n❌ Элементов не найдено: {totalNotFound}{unmappedReport}");
+                    DebugWindow.Show();
                     return Result.Succeeded;
                 }
                 catch (Exception ex)
@@ -775,7 +776,7 @@ namespace IDS
                 if (string.IsNullOrWhiteSpace(ifcGuid)) return null;
 
                 // 1. Приоритетный поиск в Помещениях и Зонах (OST_Rooms, OST_Areas)
-                var targetCategories = new[] { BuiltInCategory.OST_Rooms, BuiltInCategory.OST_Areas };
+                var targetCategories = new[] { BuiltInCategory.OST_Rooms, BuiltInCategory.OST_Areas, BuiltInCategory.OST_Parking };
 
                 foreach (var bic in targetCategories)
                 {
